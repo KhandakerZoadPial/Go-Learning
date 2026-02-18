@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
@@ -25,8 +26,27 @@ type Todo struct {
 	Priority int    `db:"priority" json:"priority"`
 }
 
+type HeavyWorker struct{}
+type MarkDoneRequest struct {
+	ID int `json:"id"`
+}
+
+// Interface---------------------------------------------------------
+type TaskProcessor interface {
+	Process(title string)
+}
+
+// Implementation----------------------------------------------------
+func (hw *HeavyWorker) Process(title string) {
+	fmt.Printf("Worker: [STARTING] Heavy background task for: %s\n", title)
+	time.Sleep(5 * time.Second)
+	fmt.Printf("Worker: [FINISHED] task: %s\n", title)
+}
+
+// store--------------------------------------------------------------
 type TodoStore struct {
-	db *sqlx.DB
+	db     *sqlx.DB
+	Worker TaskProcessor
 }
 
 // -------------------------------------------------------------------
@@ -44,7 +64,7 @@ func ConnectToDatabase(dataSourceName string) (*TodoStore, error) {
 // CRUDS----------------------------------------------------------------
 func (ts *TodoStore) AddTodo(title string, priority int) (int, error) {
 	var id int
-	query := "INSERT INTO todos (title,is_done,priority) VALUES ($1, $2, $3)"
+	query := "INSERT INTO todos (title, is_done, priority) VALUES ($1, $2, $3) RETURNING id"
 	err := ts.db.QueryRowx(query, title, false, priority).Scan(&id)
 	return id, err
 
@@ -58,26 +78,32 @@ func (ts *TodoStore) GetTodos() ([]Todo, error) {
 	return data, err
 }
 
-// func (ts *TodoStore) MarkAsDone(id int) error {
+func (ts *TodoStore) MarkAsDone(id int) (string, error) {
+	var title string
+	query := "UPDATE todos SET is_done=true WHERE id=$1 RETURNING title"
+	err := ts.db.QueryRowx(query, id).Scan(&title)
 
-// }
+	return title, err
+}
 
 // ENDPOINTS-------------------------------------------------------------
-func (ts *TodoStore) createTodo(w http.ResponseWriter, r *http.Request) {
+func (ts *TodoStore) handlecreateTodo(w http.ResponseWriter, r *http.Request) {
 	var data Todo
+
 	err := json.NewDecoder(r.Body).Decode(&data)
 
-	ts.AddTodo(data.Title, data.Priority)
-
+	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+
+	ts.AddTodo(data.Title, data.Priority)
+
 	json.NewEncoder(w).Encode(data)
 }
 
-func (ts *TodoStore) getAllTodo(w http.ResponseWriter, r *http.Request) {
+func (ts *TodoStore) handlegetAllTodo(w http.ResponseWriter, r *http.Request) {
 	data, err := ts.GetTodos()
 
 	if err != nil {
@@ -87,6 +113,28 @@ func (ts *TodoStore) getAllTodo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
+}
+
+func (ts *TodoStore) handleMarkComplete(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var id MarkDoneRequest
+	err := json.NewDecoder(r.Body).Decode(&id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	title, errr := ts.MarkAsDone(id.ID)
+	if errr != nil {
+		http.Error(w, "Todo not found", http.StatusNotFound)
+		return
+	}
+
+	go ts.Worker.Process(title)
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Task '%s' marked as done. Background processing started.", title)
+
 }
 
 func main() {
@@ -100,8 +148,10 @@ func main() {
 		return
 	}
 
-	http.HandleFunc("POST /create_todo", loggingMiddleware(ts.createTodo))
-	http.HandleFunc("GET /get_all_todos", loggingMiddleware(ts.getAllTodo))
+	http.HandleFunc("POST /create_todo", loggingMiddleware(ts.handlecreateTodo))
+	http.HandleFunc("GET /get_all_todos", loggingMiddleware(ts.handlegetAllTodo))
+	ts.Worker = &HeavyWorker{}
+	http.HandleFunc("POST /mark_as_complete", loggingMiddleware(ts.handleMarkComplete))
 	fmt.Println("Server starting on: 8080...")
 	err = http.ListenAndServe(":8080", nil)
 
